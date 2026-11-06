@@ -5,22 +5,25 @@ namespace MatrixInverse.Benchmarks;
 
 public static class QuickBenchmark
 {
-    // Розміри підібрані з урахуванням розміру L3 кешу типового CPU (~16-32 МБ).
-    // Розширена матриця має розмір 2*N*N*8 байт; для N=800 це ~10 МБ, що поміщається в L3
-    // і дає чисту картину масштабування CPU. Для N=1500 (~36 МБ) починаються
-    // обмеження за пропускною здатністю пам'яті - це теж цікавий випадок для аналізу.
+    // Розміри обрано так, щоб обчислювальна складність була достатньо великою
+    // для паралелізації: від ~2*10^9 (N=1000) до ~3*10^10 (N=2500) операцій
+    // множення-віднімання. Розширена матриця [A | I] займає 2*N*N*8 байт:
+    // 15.3 / 34.3 / 61.0 / 95.4 МБ - тобто всі набори вже не вміщуються в L3.
     private static readonly (string Name, int Size)[] Datasets =
     {
-        ("small",  400),
-        ("medium", 700),
-        ("large",  1000),
-        ("xlarge", 1400),
+        ("small",  1000),
+        ("medium", 1500),
+        ("large",  2000),
+        ("xlarge", 2500),
     };
 
-    private static readonly int[] WorkerCounts = { 1, 2, 4, 8, 16, 32 };
-    // Для великих матриць (N >= 1000) одна ітерація триває секунди, тому
-    // зменшуємо кількість прогонів - варіація між запусками і так низька.
-    private const int WarmupIterations = 1;
+    // Кількості потоків: степені двійки + 6 (кількість P-ядер i5-12600K),
+    // 10 (кількість фізичних ядер), 12 та 16 (кількість логічних потоків),
+    // 32 - навмисно більше за апаратну межу.
+    private static readonly int[] WorkerCounts = { 1, 2, 4, 6, 8, 10, 12, 16, 32 };
+    // Прогрів JIT виконується на невеликій матриці (щоб гарячі цикли були
+    // скомпільовані tier-1 JIT'ом), а не на повному наборі - це економить час.
+    private const int WarmupSize = 300;
     private const int MeasureIterations = 2;
     // Пауза між запусками - щоб CPU встиг охолонути і термотроттлінг
     // не спотворював результати наступних замірів.
@@ -32,7 +35,7 @@ public static class QuickBenchmark
         Console.WriteLine("─────────── ШВИДКИЙ БЕНЧМАРК ───────────");
         Console.WriteLine();
         Console.WriteLine($"  CPU cores:    {Environment.ProcessorCount}");
-        Console.WriteLine($"  Warmup:       {WarmupIterations} ітерацій");
+        Console.WriteLine($"  Warmup:       1 прогін на матриці {WarmupSize}x{WarmupSize}");
         Console.WriteLine($"  Measure:      {MeasureIterations} ітерацій (середнє)");
         Console.WriteLine();
 
@@ -47,14 +50,14 @@ public static class QuickBenchmark
             Console.WriteLine("готово.");
 
             Console.Write($"    sequential... ");
-            sequentialTimes[di] = Measure(() => new SequentialSolver().Invert(matrix));
+            sequentialTimes[di] = Measure(m => new SequentialSolver().Invert(m), matrix);
             Console.WriteLine($"{sequentialTimes[di]:F2} мс");
 
             for (int wi = 0; wi < WorkerCounts.Length; wi++)
             {
                 int workers = WorkerCounts[wi];
                 Console.Write($"    parallel (workers={workers,2})... ");
-                parallelTimes[di, wi] = Measure(() => new ParallelSolver(workers).Invert(matrix));
+                parallelTimes[di, wi] = Measure(m => new ParallelSolver(workers).Invert(m), matrix);
                 double speedup = sequentialTimes[di] / parallelTimes[di, wi];
                 Console.WriteLine($"{parallelTimes[di, wi]:F2} мс  (прискорення: {speedup:F2}x)");
             }
@@ -126,25 +129,23 @@ public static class QuickBenchmark
         return Matrix.Matrix.LoadFromFile(path);
     }
 
-    private static double Measure(Action action)
+    private static readonly Matrix.Matrix WarmupMatrix = Matrix.Matrix.GenerateRandom(WarmupSize, seed: 1);
+
+    private static double Measure(Func<Matrix.Matrix, Matrix.Matrix> invert, Matrix.Matrix matrix)
     {
-        for (int i = 0; i < WarmupIterations; i++)
-        {
-            action();
-        }
+        // Прогрів JIT на невеликій матриці тим самим солвером.
+        invert(WarmupMatrix);
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
 
         // Пауза для охолодження CPU перед вимірюванням.
-        // Без неї послідовні заміри з великим навантаженням ловлять
-        // термотроттлінг і дають менший fps на пізніших ітераціях.
         Thread.Sleep(CooldownMs);
 
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < MeasureIterations; i++)
         {
-            action();
+            invert(matrix);
         }
         sw.Stop();
 

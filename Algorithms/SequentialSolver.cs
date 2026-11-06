@@ -1,75 +1,74 @@
 namespace MatrixInverse.Algorithms;
 
 /// <summary>
-/// Послідовна реалізація алгоритму Гаусса-Жордана для обернення матриці.
-/// Працює з розширеною матрицею [A | I], яка зберігається у плоскому масиві
-/// розміру N x 2N для cache-friendly доступу. Застосовується частковий вибір
-/// головного елемента (partial pivoting) для чисельної стабільності.
+/// Послідовна (однопотокова) реалізація обернення матриці методом Гаусса-Жордана
+/// над розширеною матрицею [A | I].
+///
+/// Вибір головного елемента виконується БЕЗ перестановки рядків: якщо у стовпці k
+/// нижче діагоналі знайдено більший за модулем елемент (рядок r), то рядок r
+/// додається до опорного рядка k зі знаком, при якому модулі складаються:
+///     aug[k] := aug[k] + s * aug[r],   s = sign(aug[k][k] * aug[r][k]).
+/// Це елементарне перетворення рядків, тому права половина в кінці дорівнює A^(-1)
+/// без жодних зворотних перестановок, а порядок рядків матриці не змінюється.
+/// Новий опорний елемент |aug[k][k]| = |a_kk| + |a_rk| >= max |a_ik|.
 /// </summary>
 public sealed class SequentialSolver : ISolver
 {
+    /// <summary>Поріг, нижче якого опорний елемент вважається нульовим.</summary>
+    public const double SingularEps = 1e-15;
+
     public string Name => "sequential";
 
     public Matrix.Matrix Invert(Matrix.Matrix a)
     {
         int n = a.Size;
-        // Розширена матриця [A | I] зберігається як плоский row-major масив
-        // довжиною N*(2N). aug[i*W + j] = елемент у рядку i, стовпці j, де W = 2N.
         int w = 2 * n;
         var aug = new double[(long)n * w];
 
-        // Ініціалізація: лівa половина = A, правa половина = I
+        // Ініціалізація розширеної матриці [A | I]
         for (int i = 0; i < n; i++)
         {
             long baseIdx = (long)i * w;
             for (int j = 0; j < n; j++)
-            {
                 aug[baseIdx + j] = a[i, j];
-            }
             aug[baseIdx + n + i] = 1.0;
         }
 
-        // Прямий + зворотний хід Гаусса-Жордана з частковим pivoting'ом
         for (int k = 0; k < n; k++)
         {
-            // 1) Вибір головного елемента: знаходимо рядок з max |a[r,k]| у [k..n-1]
+            long pivotOfs = (long)k * w;
+
+            // 1) Пошук головного елемента у стовпці k серед рядків k..n-1
             int pivotRow = k;
-            double pivotVal = Math.Abs(aug[(long)k * w + k]);
+            double pivotVal = Math.Abs(aug[pivotOfs + k]);
             for (int r = k + 1; r < n; r++)
             {
                 double v = Math.Abs(aug[(long)r * w + k]);
-                if (v > pivotVal)
-                {
-                    pivotVal = v;
-                    pivotRow = r;
-                }
+                if (v > pivotVal) { pivotVal = v; pivotRow = r; }
             }
-
-            if (pivotVal < 1e-15)
+            if (pivotVal < SingularEps)
                 throw new InvalidOperationException(
                     $"Матриця вироджена або погано обумовлена: pivot[{k}] = {pivotVal}");
 
-            // 2) Перестановка рядків k <-> pivotRow (якщо потрібно)
+            // 2) Підсилення опорного рядка (без перестановки рядків) + нормалізація
+            double akk = aug[pivotOfs + k];
             if (pivotRow != k)
             {
-                long ofsK = (long)k * w;
-                long ofsP = (long)pivotRow * w;
+                long ofsR = (long)pivotRow * w;
+                double ark = aug[ofsR + k];
+                double s = akk * ark >= 0.0 ? 1.0 : -1.0;
+                double invPivot = 1.0 / (akk + s * ark);
                 for (int j = 0; j < w; j++)
-                {
-                    (aug[ofsK + j], aug[ofsP + j]) = (aug[ofsP + j], aug[ofsK + j]);
-                }
+                    aug[pivotOfs + j] = (aug[pivotOfs + j] + s * aug[ofsR + j]) * invPivot;
             }
-
-            // 3) Нормалізація опорного рядка: ділимо весь рядок на pivot
-            long pivotOfs = (long)k * w;
-            double pivot = aug[pivotOfs + k];
-            double invPivot = 1.0 / pivot;
-            for (int j = 0; j < w; j++)
+            else
             {
-                aug[pivotOfs + j] *= invPivot;
+                double invPivot = 1.0 / akk;
+                for (int j = 0; j < w; j++)
+                    aug[pivotOfs + j] *= invPivot;
             }
 
-            // 4) Виключення: для всіх інших рядків i != k віднімаємо aug[i,k] * pivotRow
+            // 3) Виключення стовпця k з усіх інших рядків - послідовно
             for (int i = 0; i < n; i++)
             {
                 if (i == k) continue;
@@ -77,21 +76,17 @@ public sealed class SequentialSolver : ISolver
                 double factor = aug[rowOfs + k];
                 if (factor == 0.0) continue;
                 for (int j = 0; j < w; j++)
-                {
                     aug[rowOfs + j] -= factor * aug[pivotOfs + j];
-                }
             }
         }
 
-        // Витягуємо праву половину - це і є A^(-1)
+        // Права половина розширеної матриці = A^(-1)
         var result = new Matrix.Matrix(n);
         for (int i = 0; i < n; i++)
         {
             long baseIdx = (long)i * w + n;
             for (int j = 0; j < n; j++)
-            {
                 result[i, j] = aug[baseIdx + j];
-            }
         }
         return result;
     }

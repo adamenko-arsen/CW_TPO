@@ -62,6 +62,20 @@ public sealed class Matrix
     /// <summary>
     /// Множення матриць A * B. Використовується для верифікації: A * A^(-1) = I.
     /// </summary>
+    /// <summary>
+    /// Щільна випадкова матриця з елементами у [-1, 1) БЕЗ діагонального домінування.
+    /// Використовується у стрес-тестах, щоб вибір головного елемента реально
+    /// спрацьовував (найбільший елемент стовпця здебільшого не на діагоналі).
+    /// </summary>
+    public static Matrix GenerateRandomDense(int n, int seed = 42)
+    {
+        var rng = new Random(seed);
+        var m = new Matrix(n);
+        for (long i = 0; i < m.Data.Length; i++)
+            m.Data[i] = rng.NextDouble() * 2.0 - 1.0;
+        return m;
+    }
+
     public static Matrix Multiply(Matrix a, Matrix b)
     {
         if (a.Size != b.Size)

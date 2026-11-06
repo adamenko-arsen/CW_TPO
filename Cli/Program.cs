@@ -220,10 +220,10 @@ internal static class Program
 
         var datasets = new (string Name, int Size)[]
         {
-            ("small",  400),
-            ("medium", 700),
-            ("large",  1000),
-            ("xlarge", 1400),
+            ("small",  1000),
+            ("medium", 1500),
+            ("large",  2000),
+            ("xlarge", 2500),
         };
 
         string testdataDir = AppPaths.FindOrCreateTestdataDir();

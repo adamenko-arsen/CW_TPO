@@ -2,16 +2,26 @@ namespace MatrixInverse.Algorithms;
 
 /// <summary>
 /// Паралельна реалізація алгоритму Гаусса-Жордана з персистентним пулом потоків
-/// та полегшеною двофазовою синхронізацією.
+/// та полегшеною бар'єрною синхронізацією (PhaseBarrier: Interlocked + пара
+/// ManualResetEventSlim).
 ///
-/// Замість System.Threading.Barrier (який внутрішньо використовує SpinWait і на
-/// великій кількості потоків породжує конкуренцію за єдину кеш-лінію лічильника)
-/// тут застосовано класичний "phase-flipping barrier" з лічильником
-/// Interlocked.Decrement та парою ManualResetEventSlim. Це дає на ~30-50% швидшу
-/// синхронізацію, особливо коли потоків більше за кількість фізичних ядер.
+/// Усі етапи алгоритму виконуються паралельно, кожен потік t працює зі своєю
+/// частиною даних, яку визначає його індекс t:
+///   - смуга рядків   [t*rowChunk, (t+1)*rowChunk)  - ініціалізація [A | I],
+///     виключення, пошук локального головного елемента, копіювання результату;
+///   - смуга стовпців [t*colChunk, (t+1)*colChunk) - підсилення та нормалізація
+///     опорного рядка.
 ///
-/// Кожен потік отримує статичний, контигуальний діапазон рядків - це мінімізує
-/// false sharing на кеш-лініях розширеної матриці [A | I].
+/// Одна ітерація k містить дві фази, розділені бар'єрами:
+///   Фаза 1 (стовпці): кожен потік редукує локальні максимуми всіх потоків
+///          (однаковий детермінований результат у кожному потоці) і формує свою
+///          частину нормалізованого опорного рядка
+///          aug[k][j] := (aug[k][j] + s*aug[r][j]) / p   для j зі своєї смуги.
+///   Фаза 2 (рядки): кожен потік виключає стовпець k зі своїх рядків і одразу
+///          (злито з виключенням) шукає локальний максимум |aug[i][k+1]| для
+///          наступної ітерації.
+/// Головний потік сам є учасником пулу (t = 0), тому окремої послідовної
+/// частини між фазами немає.
 /// </summary>
 public sealed class ParallelSolver : ISolver
 {
@@ -23,227 +33,193 @@ public sealed class ParallelSolver : ISolver
 
     public Matrix.Matrix Invert(Matrix.Matrix a)
     {
-        int n = a.Size;
-        int w = 2 * n;
-        var aug = new double[(long)n * w];
-
-        for (int i = 0; i < n; i++)
-        {
-            long baseIdx = (long)i * w;
-            for (int j = 0; j < n; j++)
-            {
-                aug[baseIdx + j] = a[i, j];
-            }
-            aug[baseIdx + n + i] = 1.0;
-        }
-
         int workers = Workers > 0 ? Workers : Environment.ProcessorCount;
-        if (n < 64 || workers <= 1)
-        {
-            return InvertSerial(aug, n, w);
-        }
+        var job = new Job(a, workers);
 
-        // Стан, що публікується головним потоком для воркерів.
-        int currentK = 0;
-        long currentPivotOfs = 0;
-        bool done = false;
-        Exception? workerException = null;
-
-        // Полегшена двофазна синхронізація через "ping-pong" подій.
-        // startEvent[phase] - воркери чекають на старт фази elimination для ітерації k;
-        // doneEvent[phase] - головний чекає, поки усі воркери завершать elimination.
-        // Дві окремі події (на парні та непарні фази) потрібні, щоб уникнути race
-        // між тим, як головний потік скидає event для наступної ітерації, та воркером,
-        // який ще не встиг "вийти" з минулої ітерації.
-        var startEvents = new[] { new ManualResetEventSlim(false), new ManualResetEventSlim(false) };
-        var doneEvents = new[] { new ManualResetEventSlim(false), new ManualResetEventSlim(false) };
-        int workersRemaining = workers;
-
-        var threads = new Thread[workers];
-        for (int t = 0; t < workers; t++)
+        // Пул: workers-1 додаткових потоків + поточний (головний) потік як t = 0.
+        var threads = new Thread[workers - 1];
+        for (int t = 1; t < workers; t++)
         {
             int threadIndex = t;
-            threads[t] = new Thread(() =>
+            threads[t - 1] = new Thread(() => job.Worker(threadIndex))
             {
-                try
-                {
-                    int chunk = (n + workers - 1) / workers;
-                    int rowFrom = threadIndex * chunk;
-                    int rowTo = Math.Min(rowFrom + chunk, n);
-                    int phase = 0;
-
-                    while (true)
-                    {
-                        // Чекаємо сигнал від головного потоку.
-                        startEvents[phase].Wait();
-
-                        if (Volatile.Read(ref done)) return;
-
-                        int k = currentK;
-                        long pivotOfs = currentPivotOfs;
-
-                        // Elimination на власній смузі рядків.
-                        for (int i = rowFrom; i < rowTo; i++)
-                        {
-                            if (i == k) continue;
-                            long rowOfs = (long)i * w;
-                            double factor = aug[rowOfs + k];
-                            if (factor == 0.0) continue;
-                            for (int j = 0; j < w; j++)
-                            {
-                                aug[rowOfs + j] -= factor * aug[pivotOfs + j];
-                            }
-                        }
-
-                        // Останній воркер сигналізує головному потоку про завершення фази.
-                        if (Interlocked.Decrement(ref workersRemaining) == 0)
-                        {
-                            doneEvents[phase].Set();
-                        }
-
-                        phase ^= 1;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Volatile.Write(ref workerException, ex);
-                    Volatile.Write(ref done, true);
-                    if (Interlocked.Decrement(ref workersRemaining) == 0)
-                    {
-                        // Не знаємо точно, в якій ми фазі - сигналізуємо обидва events.
-                        doneEvents[0].Set();
-                        doneEvents[1].Set();
-                    }
-                }
-            })
-            { IsBackground = true, Name = $"GaussJordan-Worker-{threadIndex}" };
-            threads[t].Start();
+                IsBackground = true,
+                Name = $"GaussJordan-Worker-{threadIndex}"
+            };
+            threads[t - 1].Start();
         }
 
-        int mainPhase = 0;
-        try
-        {
-            for (int k = 0; k < n; k++)
-            {
-                if (Volatile.Read(ref workerException) != null) break;
+        job.Worker(0);
+        foreach (var th in threads) th.Join();
+        job.Barrier.Dispose();
 
-                // 1) Pivot search
-                int pivotRow = k;
-                double pivotVal = Math.Abs(aug[(long)k * w + k]);
-                for (int r = k + 1; r < n; r++)
-                {
-                    double v = Math.Abs(aug[(long)r * w + k]);
-                    if (v > pivotVal) { pivotVal = v; pivotRow = r; }
-                }
-                if (pivotVal < 1e-15)
-                {
-                    Volatile.Write(ref workerException,
-                        new InvalidOperationException(
-                            $"Матриця вироджена або погано обумовлена: pivot[{k}] = {pivotVal}"));
-                    break;
-                }
-
-                // 2) Swap
-                if (pivotRow != k)
-                {
-                    long ofsK = (long)k * w;
-                    long ofsP = (long)pivotRow * w;
-                    for (int j = 0; j < w; j++)
-                        (aug[ofsK + j], aug[ofsP + j]) = (aug[ofsP + j], aug[ofsK + j]);
-                }
-
-                // 3) Normalize
-                long pivotOfs = (long)k * w;
-                double pivot = aug[pivotOfs + k];
-                double invPivot = 1.0 / pivot;
-                for (int j = 0; j < w; j++) aug[pivotOfs + j] *= invPivot;
-
-                // 4) Publish state and signal workers.
-                currentK = k;
-                currentPivotOfs = pivotOfs;
-                Volatile.Write(ref workersRemaining, workers);
-                // Скидаємо doneEvent поточної фази (бо ми зараз будемо чекати на нього).
-                doneEvents[mainPhase].Reset();
-                // Сигналізуємо воркерам стартувати.
-                startEvents[mainPhase].Set();
-                // Чекаємо завершення elimination.
-                doneEvents[mainPhase].Wait();
-                // Готуємо event поточної фази для наступного циклу і переходимо до іншої фази.
-                startEvents[mainPhase].Reset();
-                mainPhase ^= 1;
-            }
-        }
-        finally
-        {
-            // Завершення воркерів: ставимо done і піднімаємо обидва start-events,
-            // щоб ніхто з потоків не залишився заблокованим.
-            Volatile.Write(ref done, true);
-            startEvents[0].Set();
-            startEvents[1].Set();
-            foreach (var th in threads) th.Join();
-
-            startEvents[0].Dispose();
-            startEvents[1].Dispose();
-            doneEvents[0].Dispose();
-            doneEvents[1].Dispose();
-        }
-
-        if (workerException != null) throw workerException;
-
-        var result = new Matrix.Matrix(n);
-        for (int i = 0; i < n; i++)
-        {
-            long baseIdx = (long)i * w + n;
-            for (int j = 0; j < n; j++) result[i, j] = aug[baseIdx + j];
-        }
-        return result;
+        if (job.Error != null) throw job.Error;
+        if (job.SingularStep >= 0)
+            throw new InvalidOperationException(
+                $"Матриця вироджена або погано обумовлена: pivot[{job.SingularStep}] = {job.SingularValue}");
+        return job.Result;
     }
 
-    private static Matrix.Matrix InvertSerial(double[] aug, int n, int w)
+    /// <summary>Спільний стан однієї операції обернення.</summary>
+    private sealed class Job
     {
-        for (int k = 0; k < n; k++)
+        private readonly Matrix.Matrix _a;
+        private readonly int _n, _w, _workers, _rowChunk, _colChunk;
+        private readonly double[] _aug;
+
+        // Локальні результати пошуку головного елемента (по одному на потік).
+        private readonly double[] _localMax;   // max |aug[i][k]| серед своїх рядків i >= k
+        private readonly int[] _localRow;      // номер рядка з цим максимумом
+        private readonly double[] _localVal;   // значення aug[i][k] (зі знаком)
+        private readonly double[] _diag;       // aug[k][k], пише лише власник рядка k
+
+        public readonly PhaseBarrier Barrier;
+        public readonly Matrix.Matrix Result;
+        public volatile Exception? Error;
+        public int SingularStep = -1;
+        public double SingularValue;
+
+        public Job(Matrix.Matrix a, int workers)
         {
-            int pivotRow = k;
-            double pivotVal = Math.Abs(aug[(long)k * w + k]);
-            for (int r = k + 1; r < n; r++)
+            _a = a;
+            _n = a.Size;
+            _w = 2 * _n;
+            _workers = workers;
+            _rowChunk = (_n + workers - 1) / workers;
+            _colChunk = (_w + workers - 1) / workers;
+            _aug = new double[(long)_n * _w];
+            _localMax = new double[workers];
+            _localRow = new int[workers];
+            _localVal = new double[workers];
+            _diag = new double[workers];
+            Barrier = new PhaseBarrier(workers);
+            Result = new Matrix.Matrix(_n);
+        }
+
+        public void Worker(int t)
+        {
+            int n = _n, w = _w;
+            double[] aug = _aug;
+            int rowFrom = Math.Min(n, t * _rowChunk);
+            int rowTo = Math.Min(n, rowFrom + _rowChunk);
+            int colFrom = Math.Min(w, t * _colChunk);
+            int colTo = Math.Min(w, colFrom + _colChunk);
+            int phase = 0;
+
+            try
             {
-                double v = Math.Abs(aug[(long)r * w + k]);
-                if (v > pivotVal) { pivotVal = v; pivotRow = r; }
+                // 0) Паралельна ініціалізація своїх рядків [A | I] + пошук pivot для k = 0.
+                double[] src = _a.Data;
+                for (int i = rowFrom; i < rowTo; i++)
+                {
+                    long rowOfs = (long)i * w;
+                    Array.Copy(src, (long)i * n, aug, rowOfs, n);
+                    aug[rowOfs + n + i] = 1.0;
+                }
+                ScanColumn(t, 0, rowFrom, rowTo);
+                Barrier.SignalAndWait(ref phase);
+
+                for (int k = 0; k < n; k++)
+                {
+                    // 1) Редукція локальних максимумів (однаково в усіх потоках).
+                    int pivotRow = -1;
+                    double pivotVal = -1.0, ark = 0.0;
+                    for (int u = 0; u < _workers; u++)
+                    {
+                        if (_localMax[u] > pivotVal)
+                        {
+                            pivotVal = _localMax[u];
+                            pivotRow = _localRow[u];
+                            ark = _localVal[u];
+                        }
+                    }
+                    if (pivotVal < SequentialSolver.SingularEps)
+                    {
+                        if (t == 0) { SingularStep = k; SingularValue = Math.Max(pivotVal, 0.0); }
+                        break; // усі потоки бачать те саме значення і виходять разом
+                    }
+
+                    // 2) Своя смуга стовпців опорного рядка: підсилення + нормалізація.
+                    long pivotOfs = (long)k * w;
+                    double akk = _diag[k / _rowChunk];
+                    if (pivotRow != k)
+                    {
+                        long ofsR = (long)pivotRow * w;
+                        double s = akk * ark >= 0.0 ? 1.0 : -1.0;
+                        double invPivot = 1.0 / (akk + s * ark);
+                        for (int j = colFrom; j < colTo; j++)
+                            aug[pivotOfs + j] = (aug[pivotOfs + j] + s * aug[ofsR + j]) * invPivot;
+                    }
+                    else
+                    {
+                        double invPivot = 1.0 / akk;
+                        for (int j = colFrom; j < colTo; j++)
+                            aug[pivotOfs + j] *= invPivot;
+                    }
+                    Barrier.SignalAndWait(ref phase);
+
+                    // 3) Виключення у своїх рядках + пошук pivot для k + 1 (злито).
+                    int next = k + 1;
+                    double best = -1.0, bestVal = 0.0;
+                    int bestRow = -1;
+                    for (int i = rowFrom; i < rowTo; i++)
+                    {
+                        if (i == k) continue;
+                        long rowOfs = (long)i * w;
+                        double factor = aug[rowOfs + k];
+                        if (factor != 0.0)
+                        {
+                            for (int j = 0; j < w; j++)
+                                aug[rowOfs + j] -= factor * aug[pivotOfs + j];
+                        }
+                        if (i >= next && next < n)
+                        {
+                            double v = aug[rowOfs + next];
+                            if (i == next) _diag[t] = v;
+                            double av = Math.Abs(v);
+                            if (av > best) { best = av; bestRow = i; bestVal = v; }
+                        }
+                    }
+                    _localMax[t] = best;
+                    _localRow[t] = bestRow;
+                    _localVal[t] = bestVal;
+                    Barrier.SignalAndWait(ref phase);
+                }
+
+                // 4) Паралельне копіювання своїх рядків правої половини у результат.
+                if (SingularStep < 0)
+                {
+                    double[] dst = Result.Data;
+                    for (int i = rowFrom; i < rowTo; i++)
+                        Array.Copy(aug, (long)i * w + n, dst, (long)i * n, n);
+                }
             }
-            if (pivotVal < 1e-15)
-                throw new InvalidOperationException(
-                    $"Матриця вироджена або погано обумовлена: pivot[{k}] = {pivotVal}");
-
-            if (pivotRow != k)
+            catch (OperationCanceledException) when (Error != null)
             {
-                long ofsK = (long)k * w;
-                long ofsP = (long)pivotRow * w;
-                for (int j = 0; j < w; j++)
-                    (aug[ofsK + j], aug[ofsP + j]) = (aug[ofsP + j], aug[ofsK + j]);
+                // Інший потік уже зафіксував помилку і перервав бар'єр.
             }
-
-            long pivotOfs = (long)k * w;
-            double pivot = aug[pivotOfs + k];
-            double invPivot = 1.0 / pivot;
-            for (int j = 0; j < w; j++) aug[pivotOfs + j] *= invPivot;
-
-            for (int i = 0; i < n; i++)
+            catch (Exception ex)
             {
-                if (i == k) continue;
-                long rowOfs = (long)i * w;
-                double factor = aug[rowOfs + k];
-                if (factor == 0.0) continue;
-                for (int j = 0; j < w; j++)
-                    aug[rowOfs + j] -= factor * aug[pivotOfs + j];
+                Error ??= ex;
+                Barrier.Abort();
             }
         }
 
-        var result = new Matrix.Matrix(n);
-        for (int i = 0; i < n; i++)
+        /// <summary>Локальний пошук max |aug[i][col]| серед своїх рядків i >= col.</summary>
+        private void ScanColumn(int t, int col, int rowFrom, int rowTo)
         {
-            long baseIdx = (long)i * w + n;
-            for (int j = 0; j < n; j++) result[i, j] = aug[baseIdx + j];
+            double best = -1.0, bestVal = 0.0;
+            int bestRow = -1;
+            for (int i = Math.Max(rowFrom, col); i < rowTo; i++)
+            {
+                double v = _aug[(long)i * _w + col];
+                if (i == col) _diag[t] = v;
+                double av = Math.Abs(v);
+                if (av > best) { best = av; bestRow = i; bestVal = v; }
+            }
+            _localMax[t] = best;
+            _localRow[t] = bestRow;
+            _localVal[t] = bestVal;
         }
-        return result;
     }
 }

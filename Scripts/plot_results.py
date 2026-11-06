@@ -83,8 +83,10 @@ def plot_time(data, out_path):
     ax.set_title("Час виконання паралельного алгоритму\nна матрицях різного розміру", fontsize=13)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
-    ax.set_xticks([1, 2, 4, 8, 16, 32])
-    ax.set_xticklabels([1, 2, 4, 8, 16, 32])
+    all_workers = sorted({w for d in data.values() for w in d["times"]})
+    ax.set_xticks(all_workers)
+    ax.set_xticklabels(all_workers)
+    ax.minorticks_off()
     ax.grid(True, which="both", linestyle="--", alpha=0.5)
     ax.legend(loc="best", fontsize=10)
     plt.tight_layout()
@@ -117,8 +119,10 @@ def plot_speedup(data, out_path):
     ax.set_ylabel("Коефіцієнт прискорення (S = T_seq / T_par)", fontsize=12)
     ax.set_title("Залежність коефіцієнта прискорення\nвід кількості потоків", fontsize=13)
     ax.set_xscale("log", base=2)
-    ax.set_xticks([1, 2, 4, 8, 16, 32])
-    ax.set_xticklabels([1, 2, 4, 8, 16, 32])
+    all_workers = sorted({w for d in data.values() for w in d["times"]})
+    ax.set_xticks(all_workers)
+    ax.set_xticklabels(all_workers)
+    ax.minorticks_off()
     ax.grid(True, which="both", linestyle="--", alpha=0.5)
     ax.legend(loc="best", fontsize=10)
     plt.tight_layout()
@@ -138,6 +142,7 @@ def plot_size(data, out_path):
     fig, ax = plt.subplots(figsize=(10, 6))
     workers_set = sorted(data[available[0]]["speedups"].keys())
     width = 0.2
+    fig.set_size_inches(12, 6)
     x_positions = list(range(len(workers_set)))
     colors = {
         "small":  "#1f77b4",

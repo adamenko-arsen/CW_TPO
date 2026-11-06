@@ -19,7 +19,11 @@ public static class TestRunner
             ("Random 50x50: A * A^-1 == I", TestRandom50),
             ("Singular matrix throws (sequential)", TestSingularSequential),
             ("Singular matrix throws (parallel)", TestSingularParallel),
-            ("Stress: Sequential vs Parallel agree on 200x200", TestStressAgreement),
+            ("Stress: Seq == Par, 1000x1000, 1..32 потоків", TestStressDiagDominant),
+            ("Stress: Seq == Par, dense 1200x1200 з вибором pivot", TestStressPivoting),
+            ("Stress: Seq == Par, N=1531 (не кратне), 3/7/10/13 потоків", TestStressOddSize),
+            ("Stress: 1000x1000, A * A^-1 == I (parallel, 10 потоків)", TestStressIdentity),
+            ("Repeat: 5 запусків по 16 потоків дають однаковий результат", TestRepeatability),
         };
 
         Console.WriteLine();
@@ -54,18 +58,21 @@ public static class TestRunner
         yield return new SequentialSolver();
         yield return new ParallelSolver(workers: 1);
         yield return new ParallelSolver(workers: 2);
+        yield return new ParallelSolver(workers: 3);
         yield return new ParallelSolver(workers: 4);
         yield return new ParallelSolver(workers: 8);
+        yield return new ParallelSolver(workers: 16);
     }
 
-    private static void AssertEquivalentToIdentity(Matrix.Matrix a, Matrix.Matrix inv)
+    private static void AssertEquivalentToIdentity(Matrix.Matrix a, Matrix.Matrix inv,
+                                                   double tolerance = Tolerance)
     {
         var product = Matrix.Matrix.Multiply(a, inv);
         var identity = Matrix.Matrix.Identity(a.Size);
         double err = Matrix.Matrix.MaxAbsoluteDifference(product, identity);
-        if (err > Tolerance)
+        if (err > tolerance)
             throw new InvalidOperationException(
-                $"||A*A^-1 - I||_inf = {err:E3} > {Tolerance:E3}");
+                $"||A*A^-1 - I||_inf = {err:E3} > {tolerance:E3}");
     }
 
     private static void TestIdentity()
@@ -140,7 +147,8 @@ public static class TestRunner
 
     private static void TestRequiresPivoting()
     {
-        // Перший pivot = 0 - алгоритм мусить переставити рядки
+        // Перший pivot = 0 - алгоритм мусить підсилити опорний рядок,
+        // додавши до нього рядок з найбільшим за модулем елементом стовпця
         var a = new Matrix.Matrix(3);
         a[0, 0] = 0; a[0, 1] = 1; a[0, 2] = 2;
         a[1, 0] = 1; a[1, 1] = 0; a[1, 2] = 3;
@@ -204,29 +212,78 @@ public static class TestRunner
             new ParallelSolver(workers: 4).Invert(a);
             throw new InvalidOperationException("Очікувалось виключення");
         }
-        catch (AggregateException ae) when (ae.InnerException is InvalidOperationException io
-                                            && io.Message.Contains("вироджена"))
-        {
-            // Parallel.For загортає виключення у AggregateException
-        }
         catch (InvalidOperationException ex) when (ex.Message.Contains("вироджена"))
         {
+            // Очікувана поведінка: усі потоки пулу однаково виявили нульовий
+            // головний елемент, коректно завершились, а виняток кинуто з Invert.
         }
     }
 
-    private static void TestStressAgreement()
+    // ───────────── Стрес-тести паралельної версії на великих матрицях ─────────────
+    // Розміри обрано так, щоб на кожен потік припадали сотні рядків, а фаза
+    // виключення тривала мілісекунди: конфлікти потоків (гонки, неповна
+    // синхронізація фаз, невидимість записів) за таких умов неминуче проявили б
+    // себе. Послідовна та паралельна версії виконують ідентичні арифметичні
+    // операції в однаковому порядку, тому за відсутності гонок результати
+    // мають збігатися ПОБІТОВО (різниця рівно 0).
+
+    private static readonly int[] StressWorkers = { 1, 2, 3, 4, 6, 8, 10, 12, 16, 32 };
+
+    private static void AssertSameAsSequential(Matrix.Matrix a, IEnumerable<int> workerCounts)
     {
-        var a = Matrix.Matrix.GenerateRandom(200, seed: 789);
-
         var seqResult = new SequentialSolver().Invert(a);
-
-        foreach (int workers in new[] { 1, 2, 4, 8, 16 })
+        foreach (int workers in workerCounts)
         {
             var parResult = new ParallelSolver(workers).Invert(a);
             double diff = Matrix.Matrix.MaxAbsoluteDifference(seqResult, parResult);
-            if (diff > 1e-10)
+            if (diff != 0.0)
                 throw new InvalidOperationException(
-                    $"ParallelSolver(workers={workers}) розійшовся з SequentialSolver: diff={diff:E3}");
+                    $"N={a.Size}, workers={workers}: результат відрізняється від послідовного, diff={diff:E3}");
+        }
+    }
+
+    private static void TestStressDiagDominant()
+    {
+        var a = Matrix.Matrix.GenerateRandom(1000, seed: 789);
+        AssertSameAsSequential(a, StressWorkers);
+    }
+
+    private static void TestStressPivoting()
+    {
+        // Щільна випадкова матриця без діагонального домінування: головний
+        // елемент майже на кожній ітерації знаходиться в іншому рядку, тож
+        // постійно працює гілка підсилення опорного рядка (читання чужого рядка r).
+        var a = Matrix.Matrix.GenerateRandomDense(1200, seed: 2024);
+        AssertSameAsSequential(a, new[] { 2, 4, 8, 10, 16 });
+        AssertEquivalentToIdentity(a, new ParallelSolver(10).Invert(a), 1e-8);
+    }
+
+    private static void TestStressOddSize()
+    {
+        // 1531 - просте число: смуги рядків і стовпців мають різну довжину,
+        // останній потік отримує неповну смугу.
+        var a = Matrix.Matrix.GenerateRandom(1531, seed: 31);
+        AssertSameAsSequential(a, new[] { 3, 7, 10, 13 });
+    }
+
+    private static void TestStressIdentity()
+    {
+        var a = Matrix.Matrix.GenerateRandom(1000, seed: 1000);
+        var inv = new ParallelSolver(10).Invert(a);
+        AssertEquivalentToIdentity(a, inv);
+    }
+
+    private static void TestRepeatability()
+    {
+        var a = Matrix.Matrix.GenerateRandomDense(1000, seed: 77);
+        var first = new ParallelSolver(16).Invert(a);
+        for (int run = 1; run < 5; run++)
+        {
+            var again = new ParallelSolver(16).Invert(a);
+            double diff = Matrix.Matrix.MaxAbsoluteDifference(first, again);
+            if (diff != 0.0)
+                throw new InvalidOperationException(
+                    $"Запуск {run + 1} відрізняється від першого: diff={diff:E3}");
         }
     }
 }
